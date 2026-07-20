@@ -1,5 +1,6 @@
 import ast
 import os
+import sys
 import subprocess
 import threading
 import tkinter as tk
@@ -7,15 +8,15 @@ from tkinter import filedialog, messagebox, ttk
 
 
 def collect_tests_from_file(file_path):
-    """Parses a single Python file using AST to find all test functions and test classes/methods."""
+    """Parses a single Python file using AST to find all test functions and test classes/methods (including async)."""
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             node = ast.parse(f.read(), filename=file_path)
 
         tests = []
         for top_level_item in node.body:
-            # Standalone functions starting with 'test_'
-            if isinstance(top_level_item, ast.FunctionDef):
+            # Standalone functions (sync & async) starting with 'test_'
+            if isinstance(top_level_item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if top_level_item.name.startswith("test_"):
                     tests.append(top_level_item.name)
 
@@ -23,7 +24,7 @@ def collect_tests_from_file(file_path):
             elif isinstance(top_level_item, ast.ClassDef):
                 if top_level_item.name.startswith("Test"):
                     for sub_item in top_level_item.body:
-                        if isinstance(sub_item, ast.FunctionDef):
+                        if isinstance(sub_item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                             if sub_item.name.startswith("test_"):
                                 tests.append(
                                     f"{top_level_item.name}::{sub_item.name}"
@@ -54,13 +55,28 @@ class PytestGranularGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Pytest Selective Test Runner & Exporter")
-        self.root.geometry("1000x780")
+        self.root.geometry("1000x820")
 
         self.selected_files = []
         self.current_folder = ""
+        self.pytest_executable = "pytest"  # Default fallback
 
-        # Top Section - Choose Target(s)
-        file_frame = ttk.LabelFrame(root, text="Step 1: Choose Target(s)")
+        # Step 1: Virtual Environment Section
+        venv_frame = ttk.LabelFrame(root, text="Step 1: Select Virtual Environment (Optional)")
+        venv_frame.pack(fill="x", padx=15, pady=5)
+
+        self.venv_path_var = tk.StringVar(value="Default system/environment pytest")
+        ttk.Entry(
+            venv_frame, textvariable=self.venv_path_var, state="readonly"
+        ).grid(row=0, column=0, sticky="ew", padx=10, pady=5)
+        ttk.Button(
+            venv_frame, text="Browse Venv Directory", command=self.browse_venv
+        ).grid(row=0, column=1, padx=10, pady=5, sticky="e")
+
+        venv_frame.columnconfigure(0, weight=1)
+
+        # Step 2: Target Selection
+        file_frame = ttk.LabelFrame(root, text="Step 2: Choose Target(s)")
         file_frame.pack(fill="x", padx=15, pady=5)
 
         self.files_display_var = tk.StringVar(value="No files selected.")
@@ -81,7 +97,7 @@ class PytestGranularGUI:
 
         file_frame.columnconfigure(1, weight=1)
 
-        # Middle Section - Discovery Buttons
+        # Discovery Buttons
         disc_frame = ttk.Frame(root)
         disc_frame.pack(fill="x", padx=15, pady=5)
 
@@ -131,20 +147,53 @@ class PytestGranularGUI:
         btn_control_frame = ttk.Frame(root)
         btn_control_frame.pack(fill="x", padx=15, pady=10)
 
-        # Running the tests
         ttk.Button(
             btn_control_frame,
             text="Run Highlighted Tests 🏃",
             command=self.run_highlighted_tests_thread,
-            style="Accent.TButton",
         ).pack(side="left", fill="x", expand=True, padx=5, ipady=5)
 
-        # Exporting output
         ttk.Button(
             btn_control_frame,
             text="💾 Export Console Log",
             command=self.export_console_log,
         ).pack(side="right", fill="x", expand=True, padx=5, ipady=5)
+
+    def browse_venv(self):
+        """Allows user to select a virtualenv directory and resolves the pytest executable."""
+        venv_dir = filedialog.askdirectory(title="Select Virtual Environment Root Directory")
+        if not venv_dir:
+            return
+
+        # Windows paths check
+        win_pytest = os.path.join(venv_dir, "Scripts", "pytest.exe")
+        win_python = os.path.join(venv_dir, "Scripts", "python.exe")
+
+        # Unix/macOS paths check
+        posix_pytest = os.path.join(venv_dir, "bin", "pytest")
+        posix_python = os.path.join(venv_dir, "bin", "python")
+
+        if os.path.isfile(win_pytest):
+            self.pytest_executable = win_pytest
+            self.venv_path_var.set(self.pytest_executable)
+        elif os.path.isfile(posix_pytest):
+            self.pytest_executable = posix_pytest
+            self.venv_path_var.set(self.pytest_executable)
+        # If pytest binary is missing, check if python binary exists to invoke via python -m pytest
+        elif os.path.isfile(win_python):
+            self.pytest_executable = win_python
+            self.venv_path_var.set(f"{win_python} (-m pytest)")
+        elif os.path.isfile(posix_python):
+            self.pytest_executable = posix_python
+            self.venv_path_var.set(f"{posix_python} (-m pytest)")
+        else:
+            messagebox.showerror(
+                "Invalid Virtualenv",
+                "Could not find a valid executable inside 'Scripts/' or 'bin/'.\n"
+                "Reverting to default environment pytest.",
+            )
+            self.pytest_executable = "pytest"
+            self.venv_path_var.set("Default system/environment pytest")
 
     def browse_files(self):
         files_selected = filedialog.askopenfilenames(
@@ -166,6 +215,10 @@ class PytestGranularGUI:
             self.current_folder = folder_selected
 
     def print_to_console(self, text_str):
+        """Thread-safe UI update wrapper."""
+        self.root.after(0, self._append_to_console, text_str)
+
+    def _append_to_console(self, text_str):
         self.txt_output.insert(tk.END, text_str)
         self.txt_output.see(tk.END)
 
@@ -205,13 +258,22 @@ class PytestGranularGUI:
         ).start()
 
     def execute_pytest_subprocess(self, test_targets):
-        self.txt_output.delete("1.0", tk.END)
+        # Clear console on main thread safely
+        self.root.after(0, lambda: self.txt_output.delete("1.0", tk.END))
+
+        # Prepare command based on whether pytest executable or python executable was located
+        if self.pytest_executable.endswith("python") or self.pytest_executable.endswith("python.exe"):
+            cmd = [self.pytest_executable, "-m", "pytest", "-v"] + test_targets
+        else:
+            cmd = [self.pytest_executable, "-v"] + test_targets
+
+        self.print_to_console(f"🔧 Command: {' '.join(cmd)}\n")
         self.print_to_console(f"🚀 Running {len(test_targets)} selected tests...\n")
         self.print_to_console("=" * 60 + "\n")
 
         try:
             process = subprocess.Popen(
-                ["python", "-m", "pytest", "-v"] + test_targets,
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -237,20 +299,18 @@ class PytestGranularGUI:
 
     def export_console_log(self):
         """Saves the current contents of the output text box to a file."""
-        # Get all text from the console window
         console_content = self.txt_output.get("1.0", tk.END).strip()
-        
+
         if not console_content:
             messagebox.showwarning("Warning", "Console is empty! Nothing to export.")
             return
 
-        # Open a save dialog window
         file_path = filedialog.asksaveasfilename(
             defaultextension=".log",
             filetypes=[("Log Files", "*.log"), ("Text Files", "*.txt"), ("All Files", "*.*")],
             title="Save Execution Output Log"
         )
-        
+
         if file_path:
             try:
                 with open(file_path, "w", encoding="utf-8") as f:
